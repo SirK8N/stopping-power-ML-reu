@@ -85,25 +85,32 @@ class ProjectileFeaturizer(BaseFeaturizer):
 
 
 class IonIonForce(ProjectileFeaturizer):
-    """Compute the stopping force acting on a particle from ion-ion repulsion
-    
-    Computes the force from the repulsion of nuclei (i.e., the charge on each atom is 
-    its atomic number) projected along the particle's direction of travel. 
-    
-    Input: Position and velocity of projectile
-    
-    Parameters:
-        acc - float, accuracy of the Ewald summation (default=3)"""
+    """Compute the stopping force acting on a particle from ion-ion repulsion.
 
-    def __init__(self, simulation_cell, acc=3, **kwargs):
+    Computes the force from the repulsion of nuclei (i.e., the charge on each atom is
+    its atomic number) projected along the particle's direction of travel.
+
+    Input: Position and velocity of projectile
+
+    Parameters:
+        acc (float): accuracy of the Ewald summation (default=3)
+        flatten (bool): if True, return the 3D force components as a flat list with labels
+                        ion-ion_x, ion-ion_y, ion-ion_z; otherwise return magnitude with
+                        label ion-ion repulsion
+    """
+
+    def __init__(self, simulation_cell, acc=3, flatten=False, **kwargs):
         super(IonIonForce, self).__init__(simulation_cell, **kwargs)
         self.acc = acc
+        self.flatten = flatten
 
     def feature_labels(self):
-        return ["ion-ion_x", "ion-ion_y", "ion-ion_z"]
+        if self.flatten:
+            return ["ion-ion_x", "ion-ion_y", "ion-ion_z"]
+        return ["ion-ion repulsion"]
 
     def featurize(self, position, velocity):
-        # Get the atoms object as a pymatgen Structure
+        # Insert projectile and get structure
         strc = self._insert_projectile(position)
 
         # Convert lattice from Bohr to Angstrom
@@ -113,12 +120,16 @@ class IonIonForce(ProjectileFeaturizer):
         for site in strc.sites:
             site.charge = site.specie.Z
 
-        # Compute the forces
+        # Compute the forces via Ewald summation
         ewald = EwaldSummation(strc, compute_forces=True, acc_factor=self.acc)
 
-        # Compute force
-        my_force = ewald.forces[-1, :] * 0.01944688972 #from eV/Angsrtom to Hartree/Bohr
-        return list(my_force)
+        # Extract the force vector on the projectile (last atom)
+        force_vector = ewald.forces[-1, :] * 0.01944688972  # eV/Å to Ha/Bohr
+
+        # Return either components or magnitude
+        if self.flatten:
+            return force_vector.tolist()
+        return [np.linalg.norm(force_vector)]
 
     def implementors(self):
         return ['Logan Ward']
@@ -153,32 +164,49 @@ Compute the local electronic charge density around a projectile.
 class ClosestAtomsDistances(ProjectileFeaturizer):
     """
     Compute distances to the n closest atoms around the projectile.
+
+    Parameters:
+        simulation_cell: ASE or pymatgen structure of the host material
+        n_closest (int): number of nearest neighbors to consider (default=1)
+        coulombic (bool): if True, return 1/distance^2; otherwise return raw distances
     """
 
-    def __init__(self, simulation_cell, n_closest=1, **kwargs):
+    def __init__(self, simulation_cell, n_closest=1, coulombic=False, **kwargs):
         super().__init__(simulation_cell, **kwargs)
         self.n_closest = n_closest
-        self.atoms_list = [AseAtomsAdaptor.get_structure(atom) for atom in split_atoms_based_on_species(simulation_cell)]
+        self.coulombic = coulombic
+        # Prepare list of per-species structures for neighbor search
+        self.atoms_list = [AseAtomsAdaptor.get_structure(atom)
+                           for atom in split_atoms_based_on_species(simulation_cell)]
 
     def feature_labels(self):
-        return [f"distance_to_atom_{i}" for i in range(self.n_closest)]
+        prefix = "coulombic_distance_to_atom" if self.coulombic else "distance_to_atom"
+        return [f"{prefix}_{i}" for i in range(self.n_closest)]
 
     def featurize(self, position, velocity):
         all_distances = []
-
         for atom in self.atoms_list:
+            # Insert projectile at given position
             strc = insert_projectile(atom.copy(), 'H', position)
             proj_site = strc.sites[-1]
+            # Find neighbors within a cutoff radius
             neighbors = strc.get_neighbors(proj_site, r=10)
 
-            # Sort neighbors by distance to the projectile
+            # Sort by Euclidean distance
             sorted_neighbors = sorted(neighbors, key=lambda n: n.distance(proj_site))
+            # Compute distances or inverse-square values
+            if self.coulombic:
+                values = [1.0 / (n.distance(proj_site) ** 2)
+                          for n in sorted_neighbors[:self.n_closest]]
+            else:
+                values = [n.distance(proj_site)
+                          for n in sorted_neighbors[:self.n_closest]]
 
-            # Extract actual distance values by calling the method
-            distances = [n.distance(proj_site) for n in sorted_neighbors[:self.n_closest]]
+            all_distances.extend(values)
 
-            all_distances.extend(distances)
         return all_distances
+    
+    
 class ProjectedAGNIFingerprints(ProjectileFeaturizer):
     """Compute the fingerprints of the local atomic environment using the AGNI method
 
@@ -235,8 +263,6 @@ class ProjectedAGNIFingerprints(ProjectileFeaturizer):
             proj_fingerprints.extend(fingerprints[:, :-1].flatten())
         return proj_fingerprints
 
-
-            # Project into direction of trave
     def implementors(self):
         return ['Logan Ward']
 
@@ -278,12 +304,21 @@ class RepulsionFeatures(ProjectileFeaturizer):
 
     def citations(self):
         return []
+    
+class ProjectileDisplacement(ProjectileFeaturizer):
+
+    def feature_labels(self):
+        return ["displacement"]
+
+    def featurize(self, position, velocity, displacement):
+        
+        return [displacement]
 
 
 class ProjectileVelocity(ProjectileFeaturizer):
     """Compute the projectile velocity
     
-    Input: velocity of projectile. possibly take the direction of velocity if its magnitude is 0
+    Input: velocity of projectile.
     
     Parameters: None"""
 
@@ -357,38 +392,58 @@ def make_spherical_shell_band_offsets(r_min, r_max, n_points):
     return offsets
 
 class PositionOffset(ProjectileFeaturizer):
-    
-    def __init__(self, structure, featurizer, offsets=None):
-        super().__init__(structure)
+    """
+    Apply a base featurizer at multiple spatial offsets around the projectile.
+
+    Parameters:
+        structure: host-material structure
+        featurizer: a ProjectileFeaturizer instance to apply
+        offsets (list of array-like, optional): explicit offsets (overrides n_points)
+        n_points (int): number of points on the spherical shell
+        radius (float): radius of the spherical shell for sampling points around the projectile
+    """
+    def __init__(self, structure, featurizer, offsets=None, n_points=0, radius=0.1, **kwargs):
+        super().__init__(structure, **kwargs)
         self.structure = structure
         self.featurizer = featurizer
-        
-        shell_offsets = offsets = make_spherical_shell_offsets(radius=0.1, n_points=8)
+        self.n_points = n_points
+        self.radius = radius
+
+        # Generate offsets: zero plus spherical shell or provided list
+        if offsets is not None:
+            shell_offsets = [np.array(o) for o in offsets]
+        else:
+            shell_offsets = make_spherical_shell_offsets(radius=self.radius, n_points=self.n_points)
         self.offsets = [np.array([0.0, 0.0, 0.0])] + shell_offsets
 
-        
     def featurize(self, position, velocity=None):
+        # Apply inner featurizer at each offset and flatten to 1D
         return np.ravel([
             self.featurizer.featurize(position + offset, velocity)
             for offset in self.offsets
         ])
+
     def feature_labels(self):
         base_labels = self.featurizer.feature_labels()
         labels = []
-        
         for offset in self.offsets:
             offset_str = f"({offset[0]:.2f}, {offset[1]:.2f}, {offset[2]:.2f})"
-            for label in base_labels:
-                labels.append(f"{label} at offset {offset_str}")
+            for lbl in base_labels:
+                labels.append(f"{lbl} at offset {offset_str}")
         return labels
-         
+
     def implementors(self):
         return []
 
     def citations(self):
         return []
+
+
     
-class PoisitonAverage(ProjectileFeaturizer):
+class PoisitonAverage(ProjectileFeaturizer): 
+    '''
+    WIP NOT DONE
+    '''
     def __init__(self, structure, featurizer, offsets, decay=2.0):
         super().__init__(structure)
         self.featurizer = featurizer
